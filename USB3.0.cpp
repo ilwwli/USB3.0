@@ -10,7 +10,7 @@
 #pragma comment(lib, "FTD3XX.lib")
 using namespace std;
 // Macro Definitions
-#define BUFFER_SIZE 0x10000000
+#define BUFFER_SIZE 0x1000000
 
 // Function Declarations
 FT_STATUS Initialization(FT_HANDLE &);
@@ -18,6 +18,9 @@ FT_STATUS WINAPI ReadThread(LPVOID);
 FT_STATUS WINAPI WriteThread(LPVOID);
 BOOL LoopBackTest(UCHAR *, UCHAR *, ULONG);
 
+// Global Variables
+ifstream fin;
+ofstream fout;
 // Thread Parameter
 typedef struct __FT_STRUCT
 {
@@ -31,7 +34,7 @@ int main()
 {
 	FT_STATUS ftStatus;
 	FT_HANDLE ftHandle;	
-	//------Initialization Stage---------
+	// ----- Initialization Stage -------
 	ftStatus = Initialization(ftHandle);
 	printf("ftHandle=0x%x\n", ftHandle);
 	if (FT_FAILED(ftStatus))
@@ -41,11 +44,13 @@ int main()
 		return 0;
 	}
 	system("pause");
+	fin.open("input.txt");
+	fout.open("output.txt");
 	//-----------------------------------
-	//----------Self-Test Stage----------
+	// ----- Self-Test Stage ------------
 	UCHAR *rdBuf = new UCHAR[BUFFER_SIZE];
 	UCHAR *wrBuf = new UCHAR[BUFFER_SIZE];
-	for (int i = 0; i < BUFFER_SIZE; i++)
+	for (ULONG i = 0; i < BUFFER_SIZE; i++)
 		wrBuf[i] = i;
 	ULONG ulBytesTransferred;
 	ftStatus = FT_WritePipe(ftHandle, 0x02, wrBuf, 4096, &ulBytesTransferred, NULL);
@@ -66,7 +71,7 @@ int main()
 		printf("LoopBack Test Complete\n");
 	system("pause");
 	//-----------------------------------
-	//----------Main Stage---------------
+	// ----- Main Stage -----------------
 	HANDLE hThread[2];
 	// Write Thread
 	FT_STRUCT wrStruct(ftHandle, wrBuf);
@@ -93,10 +98,20 @@ int main()
 	}
 
 	WaitForMultipleObjects(2, hThread, TRUE, INFINITE);
-	//WaitForSingleObject(hThread, INFINITE);
-	// End of main thread creation loop.
+	//TerminateThread(hThread[0], 0);
+	//TerminateThread(hThread[1], 0);
 	printf("WrStatus : %d, RdStatus: %d\n", wrStruct.ftStatus, rdStruct.ftStatus);
 	system("pause");
+
+	//--------------------------------
+	// ----- Clear Stage -------------
+	delete rdBuf;
+	delete wrBuf;
+	FT_AbortPipe(ftHandle, 0x02);
+	FT_AbortPipe(ftHandle, 0x82);
+	fin.close();
+	fout.close();
+	//--------------------------------
 	return 0;
 }
 
@@ -148,11 +163,11 @@ FT_STATUS Initialization(FT_HANDLE &ftHandle)
 FT_STATUS WINAPI ReadThread(LPVOID lpParam)
 {
 	FT_STATUS ftStatus;
-	FT_HANDLE ftHandle;
+	FT_HANDLE ftHandle;	
 	pFT_STRUCT pftStruct = (pFT_STRUCT)lpParam;
 	ftHandle = pftStruct->ftHandle;	
 	UCHAR *acBuf = pftStruct->acBuf;
-	ULONG ulBytesTransferred = 0;
+	
 	clock_t timeLapse;
 	TCHAR msgBuf[255];
 
@@ -165,45 +180,64 @@ FT_STATUS WINAPI ReadThread(LPVOID lpParam)
 		pftStruct->ftStatus = ftStatus;
 		return ftStatus;
 	}
-	
-	
+	OVERLAPPED rdOverlapped = { 0 };
+	ftStatus = FT_InitializeOverlapped(ftHandle, &rdOverlapped);
+	if (FT_FAILED(ftStatus))
+	{
+		pftStruct->ftStatus = ftStatus;
+		return ftStatus;
+	}	
 	while (1)
 	{
 		ULONG Counter = 0;
+		ULONG ulBytesTransferred = 0;
+		ULONG ulBytesTransferredLast = 0;
 		timeLapse = clock();
 		for (int i = 0; i < 0x100; i++)
 		{
-			ftStatus = FT_ReadPipe(ftHandle, 0x82, acBuf + 0x10000 * i, 0x10000, &ulBytesTransferred, NULL);
+			//ftStatus = FT_ReadPipe(ftHandle, 0x82, acBuf + 0x1000 * i, 0x1000, &ulBytesTransferred, NULL);
+			ulBytesTransferredLast = ulBytesTransferred;
+			ftStatus = FT_ReadPipe(ftHandle, 0x82, acBuf + 0x1000 * i, 0x1000, &ulBytesTransferred, &rdOverlapped);
+			if (fout.is_open())
+			{
+				ULONG j = i ? i - 1 : 0x99;
+				fout.write(((char *)acBuf + 0x1000 * j), ulBytesTransferredLast);
+			}
+			if (ftStatus == FT_IO_PENDING)
+			{							
+				ftStatus = FT_GetOverlappedResult(ftHandle, &rdOverlapped, &ulBytesTransferred, TRUE);
+			}
 			if (FT_FAILED(ftStatus))
 			{
 				FT_AbortPipe(ftHandle, 0x82);
-				pftStruct->ftStatus = ftStatus;
-				delete acBuf;
+				pftStruct->ftStatus = ftStatus;				
 				return ftStatus;
 			}
 			Counter += ulBytesTransferred;
+			FT_ReleaseOverlapped(ftHandle, &rdOverlapped);			
 		}
 		timeLapse = clock() - timeLapse;
 		// Print the result using thread-safe functions.
 		size_t cchStringSize;
 		DWORD dwChars;
-		StringCchPrintf(msgBuf, 255, TEXT("TxSpeed:%.4f, %.4fsec Elapsed for Receiving %dMB Data\n"),
-			(Counter / 0x100000) / (((double)timeLapse) / CLOCKS_PER_SEC), ((double)timeLapse) / CLOCKS_PER_SEC, Counter / 0x100000);
+		StringCchPrintf(msgBuf, 255, TEXT("RxSpeed:%.2fMB/s, %.4fsec Elapsed for Receiving %.2fMB Data\n"),
+			(((double)Counter) / 0x100000) / (((double)timeLapse) / CLOCKS_PER_SEC), 
+			((double)timeLapse) / CLOCKS_PER_SEC, 
+			((double)Counter) / 0x100000
+		);
 		StringCchLength(msgBuf, 255, &cchStringSize);
 		WriteConsole(hStdout, msgBuf, (DWORD)cchStringSize, &dwChars, NULL);
-	}
-	delete acBuf;
+	}	
 	return ftStatus;
 }
 
 FT_STATUS WINAPI WriteThread(LPVOID lpParam)
-{
+{	
 	FT_STATUS ftStatus;
 	FT_HANDLE ftHandle;
 	pFT_STRUCT pftStruct = (pFT_STRUCT)lpParam;
 	ftHandle = pftStruct->ftHandle;	
 	UCHAR *acBuf = pftStruct->acBuf;	
-	ULONG ulBytesTransferred = 0;
 	clock_t timeLapse;
 	TCHAR msgBuf[255];
 
@@ -216,38 +250,65 @@ FT_STATUS WINAPI WriteThread(LPVOID lpParam)
 		pftStruct->ftStatus = ftStatus;
 		return ftStatus;
 	}
+	OVERLAPPED wrOverlapped = { 0 };
+	ftStatus = FT_InitializeOverlapped(ftHandle, &wrOverlapped);
+	if (FT_FAILED(ftStatus))
+	{
+		pftStruct->ftStatus = ftStatus;
+		return ftStatus;
+	}	
+	//BOOL final = 0;
 	while (1)
 	{
 		ULONG Counter = 0;
+		ULONG ulBytesTransferred = 0;
+		ULONG ulBytesReaded = 0x1000;
 		timeLapse = clock();
-		for (int i = 0; i < 0x100; i++)
+		for (ULONG i = 0; i < 0x100; i++)
 		{
-			ftStatus = FT_WritePipe(ftHandle, 0x02, acBuf + 0x10000 * i, 0x10000, &ulBytesTransferred, NULL);
+			//ftStatus = FT_WritePipe(ftHandle, 0x02, acBuf + 0x1000 * i, 0x1000, &ulBytesTransferred, NULL);
+			if (fin.is_open())
+			{
+				if (!fin)
+				{
+					pftStruct->ftStatus = ftStatus;
+					return ftStatus;
+				}
+				fin.read(((char *)acBuf + 0x1000 * i), 0x1000);
+				ulBytesReaded = fin.gcount();
+			}
+			ftStatus = FT_WritePipe(ftHandle, 0x02, acBuf + 0x1000 * i, ulBytesReaded, &ulBytesTransferred, &wrOverlapped);
+			if (ftStatus == FT_IO_PENDING)
+			{
+				ftStatus = FT_GetOverlappedResult(ftHandle, &wrOverlapped, &ulBytesTransferred, TRUE);
+			}			
 			if (FT_FAILED(ftStatus))
 			{
 				FT_AbortPipe(ftHandle, 0x02);
-				pftStruct->ftStatus = ftStatus;
-				delete acBuf;
+				pftStruct->ftStatus = ftStatus;				
 				return ftStatus;
 			}
 			Counter += ulBytesTransferred;
+			FT_ReleaseOverlapped(ftHandle, &wrOverlapped);			
 		}
 		timeLapse = clock() - timeLapse;
 		// Print the result using thread-safe functions.
 		size_t cchStringSize;
 		DWORD dwChars;
-		StringCchPrintf(msgBuf, 255, TEXT("TxSpeed:%.4f, MB/s%.4fsec Elapsed for Transmitting %dMB Data\n"),
-			(Counter / 0x100000) / (((double)timeLapse) / CLOCKS_PER_SEC), ((double)timeLapse) / CLOCKS_PER_SEC, Counter /0x100000);
+		StringCchPrintf(msgBuf, 255, TEXT("TxSpeed:%.2fMB/s, %.4fsec Elapsed for Transmitting %.2fMB Data\n"),
+			(((double)Counter) / 0x100000) / (((double)timeLapse) / CLOCKS_PER_SEC),
+			((double)timeLapse) / CLOCKS_PER_SEC,
+			((double)Counter) /0x100000
+		);
 		StringCchLength(msgBuf, 255, &cchStringSize);
 		WriteConsole(hStdout, msgBuf, (DWORD)cchStringSize, &dwChars, NULL);
-	}
-	delete acBuf;
+	}	
 	return ftStatus;
 }
 
 BOOL LoopBackTest(UCHAR *wrBuf, UCHAR *rdBuf, ULONG size)
 {
-	for (int i = 0; i < size; i++)
+	for (ULONG i = 0; i < size; i++)
 		if (wrBuf[i] != rdBuf[i])
 			return 0;
 	return 1;	
