@@ -10,7 +10,9 @@
 #pragma comment(lib, "FTD3XX.lib")
 using namespace std;
 // Macro Definitions
-#define BUFFER_SIZE 0x1000000
+#define SPEED_CNT_CYCLE 0x100
+#define MEMORY_MUL		0x100
+//#define DEBUG
 
 // Function Declarations
 FT_STATUS Initialization(FT_HANDLE &);
@@ -21,6 +23,15 @@ BOOL LoopBackTest(UCHAR *, UCHAR *, ULONG);
 // Global Variables
 ifstream fin;
 ofstream fout;
+ULONG INFRAME, OUTFRAME;
+#ifdef DEBUG
+HANDLE WrFinEvent;
+HANDLE RdFinEvent;
+HANDLE WrStartEvent;
+HANDLE RdStartEvent;
+#endif // DEBUG
+HANDLE WrSemaphore, RdSemaphore;
+CRITICAL_SECTION RdCritSect;
 // Thread Parameter
 typedef struct __FT_STRUCT
 {
@@ -33,48 +44,101 @@ typedef struct __FT_STRUCT
 int main()
 {
 	FT_STATUS ftStatus;
-	FT_HANDLE ftHandle;	
+	FT_HANDLE ftHandle;
+	INFRAME = 0x1000;
+	OUTFRAME = 0x1000;
 	// ----- Initialization Stage -------
 	ftStatus = Initialization(ftHandle);
 	printf("ftHandle=0x%x\n", ftHandle);
 	if (FT_FAILED(ftStatus))
 	{
-		printf("Initialization Failed\n");
-		system("pause");
+		printf("Initialization Failed\n");		
 		return 0;
 	}
 	system("pause");
-	fout.open("input.txt");
-	for (char j = '0'; j <= 'a'; j++)
-		for (int i = 0; i < 0x10000; i++)
-			fout << j;
+	WrSemaphore = CreateSemaphore(
+		NULL,           // default security attributes
+		2,  // initial count
+		2,  // maximum count
+		NULL);          // name
+	RdSemaphore = CreateSemaphore(
+		NULL,           // default security attributes
+		0,  // initial count
+		2,  // maximum count
+		NULL);          // name
+	if (!InitializeCriticalSectionAndSpinCount(&RdCritSect,	0x00000400)) // Init Critical Section
+		return 0;
+#ifdef DEBUG
+	UCHAR *wrBuf = new UCHAR[INFRAME * MEMORY_MUL];
+	UCHAR *rdBuf = new UCHAR[INFRAME * MEMORY_MUL];
+	for (ULONG i = 0; i < INFRAME * MEMORY_MUL; i++)
+	{
+		wrBuf[i] = i;
+		rdBuf[i] = i;
+	}
+	WrFinEvent = CreateEvent(
+		NULL,               // default security attributes
+		FALSE,              // non-manual-reset event
+		FALSE,              // initial state is nonsignaled
+		NULL				// object name
+	);
+	RdFinEvent = CreateEvent(
+		NULL,               // default security attributes
+		FALSE,              // non-manual-reset event
+		FALSE,              // initial state is nonsignaled
+		NULL				// object name
+	);
+	WrStartEvent = CreateEvent(
+		NULL,               // default security attributes
+		FALSE,              // non-manual-reset event
+		FALSE,              // initial state is nonsignaled
+		NULL				// object name
+	);
+	RdStartEvent = CreateEvent(
+		NULL,               // default security attributes
+		FALSE,              // non-manual-reset event
+		FALSE,              // initial state is nonsignaled
+		NULL				// object name
+	);
+#else
+	UCHAR *wrBuf = 0;
+	UCHAR *rdBuf = 0;
+	fout.open("input.txt");	
+	for (ULONG i = 0; i < INFRAME * 0x10; i++)
+		for (char j = '0'; j <= 'a'; j++)
+			fout.put(j);
 	fout.close();
 	fin.open("input.txt");	
 	fout.open("output.txt");
+#endif // DEBUG
 	//-----------------------------------
 	// ----- Self-Test Stage ------------
-	UCHAR *rdBuf = new UCHAR[BUFFER_SIZE];
-	UCHAR *wrBuf = new UCHAR[BUFFER_SIZE];
-	for (ULONG i = 0; i < BUFFER_SIZE; i++)
-		wrBuf[i] = i;
+	UCHAR *rdbuf = new UCHAR[0x1000];
+	UCHAR *wrbuf = new UCHAR[0x1000];
+	for (ULONG i = 0; i < 0x1000; i++)
+		wrbuf[i] = i;
 	ULONG ulBytesTransferred;
-	ftStatus = FT_WritePipe(ftHandle, 0x02, wrBuf, 4096, &ulBytesTransferred, NULL);
+	ftStatus = FT_WritePipe(ftHandle, 0x02, wrbuf, 0x1000, &ulBytesTransferred, NULL);
 	if (FT_FAILED(ftStatus))
 	{
 		printf("Write Failed\n");
 		FT_AbortPipe(ftHandle,0x02);
 	}
-	ftStatus = FT_ReadPipe(ftHandle, 0x82, rdBuf, 4096, &ulBytesTransferred, NULL);
+	ftStatus = FT_ReadPipe(ftHandle, 0x82, rdbuf, 0x1000, &ulBytesTransferred, NULL);
 	if (FT_FAILED(ftStatus))
 	{
 		printf("Read Failed\n");
 		FT_AbortPipe(ftHandle, 0x82);
 	}
-	if (!LoopBackTest(wrBuf, rdBuf, 4096))
+	if (!LoopBackTest(wrbuf, rdbuf, 0x1000))
 		printf("LoopBack Test Failed\n");
 	else
-		printf("LoopBack Test Complete\n");
+		printf("LoopBack Test Complete\n");	
+	delete rdbuf;
+	delete wrbuf;
 	system("pause");
+	FT_AbortPipe(ftHandle, 0x02);
+	FT_AbortPipe(ftHandle, 0x82);
 	//-----------------------------------
 	// ----- Main Stage -----------------
 	HANDLE hThread[2];
@@ -99,19 +163,38 @@ int main()
 	if (hThread[0] == NULL || hThread[1] == NULL)
 	{
 		printf("Create Thread Failed\n");
-		ExitProcess(3);
+		ExitProcess(0);
+	}	
+#ifdef DEBUG
+	HANDLE EventList[2] = { WrFinEvent , RdFinEvent };
+	for (int i = 0; i < 0x10; i++)
+	{
+		WaitForMultipleObjects(2, EventList, TRUE, INFINITE);
+		if (!LoopBackTest(wrBuf, rdBuf, INFRAME * MEMORY_MUL))
+		{
+			for (ULONG i = 0; i < 0x100; i++)			
+				printf("%x, %x\t", wrBuf[i], rdBuf[i]);
+			
+			printf("LoopBack Test Failed\n");
+			TerminateThread(hThread[0], 0);
+			TerminateThread(hThread[1], 0);
+			break;
+		}
+		else
+			printf("LoopBack Test Complete\n");		
+		if (!SetEvent(WrStartEvent) || !SetEvent(RdStartEvent))
+			printf("Restart Failed\n");
 	}
-
-	WaitForMultipleObjects(2, hThread, TRUE, INFINITE);
+	CloseHandle(WrFinEvent);
+	CloseHandle(RdFinEvent);
+#endif // DEBUG
+	WaitForMultipleObjects(2, hThread, TRUE, INFINITE); // Wait for ReadThread & WriteThread to join
 	//TerminateThread(hThread[0], 0);
 	//TerminateThread(hThread[1], 0);
 	printf("WrStatus : %d, RdStatus: %d\n", wrStruct.ftStatus, rdStruct.ftStatus);
 	system("pause");
-
 	//--------------------------------
-	// ----- Clear Stage -------------
-	delete rdBuf;
-	delete wrBuf;
+	// ----- Clear Stage -------------	
 	FT_AbortPipe(ftHandle, 0x02);
 	FT_AbortPipe(ftHandle, 0x82);
 	fin.close();
@@ -172,19 +255,8 @@ FT_STATUS WINAPI ReadThread(LPVOID lpParam)
 	pFT_STRUCT pftStruct = (pFT_STRUCT)lpParam;
 	ftHandle = pftStruct->ftHandle;	
 	UCHAR *sourceBuf = pftStruct->acBuf;
-	UCHAR *threadBuf[2] = { new UCHAR[0x1000], new UCHAR[0x1000] };
-	clock_t timeLapse;
-	TCHAR msgBuf[255];
-
-	HANDLE hStdout;
-	// Make sure there is a console to receive output results. 
-	hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-	if (hStdout == INVALID_HANDLE_VALUE)
-	{
-		ftStatus =  FT_OTHER_ERROR;
-		pftStruct->ftStatus = ftStatus;
-		return ftStatus;
-	}
+	UCHAR *threadBuf[2] = { new UCHAR[OUTFRAME], new UCHAR[OUTFRAME] };
+	clock_t timeLapse;	
 	OVERLAPPED rdOverlapped = { 0 };
 	ftStatus = FT_InitializeOverlapped(ftHandle, &rdOverlapped);
 	if (FT_FAILED(ftStatus))
@@ -192,28 +264,33 @@ FT_STATUS WINAPI ReadThread(LPVOID lpParam)
 		pftStruct->ftStatus = ftStatus;
 		return ftStatus;
 	}	
-	ULONG ulBytesTransferred = 0;
-	ULONG ulBytesTransferredLast = 0;
+	ULONG ulBytesTransferred = 0;	
+	volatile ULONG ulBytesTransferredLast = 0;
+
 	while (1)
 	{
 		ULONG Counter = 0;
 		timeLapse = clock();
-		for (int i = 0; i < 0x100; i++)
+		for (int i = 0; i < SPEED_CNT_CYCLE; i++)
 		{
 			//ftStatus = FT_ReadPipe(ftHandle, 0x82, acBuf + 0x1000 * i, 0x1000, &ulBytesTransferred, NULL);
-			ulBytesTransferredLast = ulBytesTransferred;
-			if (fout.is_open())
-			{
-				ftStatus = FT_ReadPipe(ftHandle, 0x82, threadBuf[i % 2], 0x1000, &ulBytesTransferred, &rdOverlapped);
-				if(ulBytesTransferredLast)
-					fout.write(((char *)threadBuf[(i + 1) % 2]), ulBytesTransferredLast);
-			}
-			else
-				ftStatus = FT_ReadPipe(ftHandle, 0x82, sourceBuf + 0x1000 * i, 0x1000, &ulBytesTransferred, &rdOverlapped);			
+			//EnterCriticalSection(&RdCritSect);	// Enter Crit Section ----------------------
+			ulBytesTransferredLast = ulBytesTransferred;			
+			WaitForSingleObject(RdSemaphore, INFINITE);
+#ifdef DEBUG
+			ftStatus = FT_ReadPipe(ftHandle, 0x82, sourceBuf + OUTFRAME * (i % MEMORY_MUL), OUTFRAME, &ulBytesTransferred, &rdOverlapped);
+#else			
+			ftStatus = FT_ReadPipe(ftHandle, 0x82, threadBuf[i % 2], OUTFRAME, &ulBytesTransferred, &rdOverlapped);
+			if(ulBytesTransferredLast)
+				fout.write(((char *)threadBuf[(i + 1) % 2]), ulBytesTransferredLast);
+#endif // DEBUG
+			//LeaveCriticalSection(&RdCritSect);	// Leave Crit Section ----------------------
 			if (ftStatus == FT_IO_PENDING)
 			{							
 				ftStatus = FT_GetOverlappedResult(ftHandle, &rdOverlapped, &ulBytesTransferred, TRUE);
 			}
+			while (!ReleaseSemaphore(WrSemaphore, 1, NULL))
+				Sleep(0);		// give up time slice
 			if (FT_FAILED(ftStatus))
 			{
 				if (fout.is_open())
@@ -221,22 +298,40 @@ FT_STATUS WINAPI ReadThread(LPVOID lpParam)
 				FT_ReleaseOverlapped(ftHandle, &rdOverlapped);
 				FT_AbortPipe(ftHandle, 0x82);
 				pftStruct->ftStatus = ftStatus;				
-				return ftStatus;
+				break;
 			}
-			Counter += ulBytesTransferred;
-					
+			Counter += ulBytesTransferred;			
 		}
 		timeLapse = clock() - timeLapse;
+
 		// Print the result using thread-safe functions.
+		TCHAR msgBuf[255];
+		HANDLE hStdout;
+		// Make sure there is a console to receive output results. 
+		hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+		if (hStdout == INVALID_HANDLE_VALUE)
+		{
+			ftStatus = FT_OTHER_ERROR;
+			pftStruct->ftStatus = ftStatus;			
+		}
 		size_t cchStringSize;
 		DWORD dwChars;
-		StringCchPrintf(msgBuf, 255, TEXT("RxSpeed:%.2fMB/s, %.4fsec Elapsed for Receiving %xMB Data\n"),
+		StringCchPrintf(msgBuf, 255, TEXT("RxSpeed:%.2fMB/s, %.4fsec for 0x%xByte Data\n"),
 			(((double)Counter) / 0x100000) / (((double)timeLapse) / CLOCKS_PER_SEC), 
 			((double)timeLapse) / CLOCKS_PER_SEC, 
-			(Counter)
+			Counter//(((double)Counter) / 0x100000)
 		);
 		StringCchLength(msgBuf, 255, &cchStringSize);
 		WriteConsole(hStdout, msgBuf, (DWORD)cchStringSize, &dwChars, NULL);
+		if (FT_FAILED(ftStatus))
+			break;
+#ifdef DEBUG
+		if (!SetEvent(RdFinEvent))
+		{
+			printf("RdT SetEvent failed (%d)\n", GetLastError());			
+		}
+		WaitForSingleObject(RdStartEvent, INFINITE);
+#endif // DEBUG
 	}	
 	return ftStatus;
 }
@@ -248,19 +343,8 @@ FT_STATUS WINAPI WriteThread(LPVOID lpParam)
 	pFT_STRUCT pftStruct = (pFT_STRUCT)lpParam;
 	ftHandle = pftStruct->ftHandle;	
 	UCHAR *sourceBuf = pftStruct->acBuf;
-	UCHAR *threadBuf[2] = { new UCHAR[0x1000], new UCHAR[0x1000] };
-	clock_t timeLapse;
-	TCHAR msgBuf[255];
-
-	HANDLE hStdout;
-	// Make sure there is a console to receive output results. 
-	hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-	if (hStdout == INVALID_HANDLE_VALUE)
-	{
-		ftStatus = FT_OTHER_ERROR;
-		pftStruct->ftStatus = ftStatus;
-		return ftStatus;
-	}
+	UCHAR *threadBuf[2] = { new UCHAR[INFRAME], new UCHAR[INFRAME] };
+	clock_t timeLapse;	
 	OVERLAPPED wrOverlapped = { 0 };
 	ftStatus = FT_InitializeOverlapped(ftHandle, &wrOverlapped);
 	if (FT_FAILED(ftStatus))
@@ -271,61 +355,94 @@ FT_STATUS WINAPI WriteThread(LPVOID lpParam)
 	ULONG ulBytesTransferred = 0;
 	ULONG ulBytesReaded = 0;
 	ULONG ulBytesReadedLast = 0;
+	// Pre-read Section
+#ifndef DEBUG	
+	fin.read(((char *)threadBuf[1]), INFRAME);
+	if (!fin)
+	{
+		ftStatus = FT_OTHER_ERROR;
+		return ftStatus;
+	}
+	ulBytesReaded = fin.gcount();	
+#endif // !DEBUG
+
+	// *** * Main Loop * ***
 	while (1)
 	{
 		ULONG Counter = 0;
-		ULONG Counterc = 0;				
+		//ULONG Counterc = 0;				
 		timeLapse = clock();
-		for (ULONG i = 0; i < 100; i++)
+		for (ULONG i = 0; i < SPEED_CNT_CYCLE; i++)
 		{
 			//ftStatus = FT_WritePipe(ftHandle, 0x02, acBuf + 0x1000 * i, 0x1000, &ulBytesTransferred, NULL);
+			/*DWORD dwWaitResult;
+			dwWaitResult = WaitForSingleObject(WrSemaphore, INFINITE);
+			if (dwWaitResult == WAIT_TIMEOUT)
+				printf("TIMEOUT\n");
+			else
+				printf("SUCCEED\n");*/
+			WaitForSingleObject(WrSemaphore, INFINITE);
+#ifdef DEBUG		
+			ftStatus = FT_WritePipe(ftHandle, 0x02, sourceBuf + INFRAME * (i % MEMORY_MUL), INFRAME, &ulBytesTransferred, &wrOverlapped);
+#else
 			ulBytesReadedLast = ulBytesReaded;
 			if (ulBytesReadedLast)
-				ftStatus = FT_WritePipe(ftHandle, 0x02, threadBuf[(i + 1) % 2], ulBytesReaded, &ulBytesTransferred, &wrOverlapped);			
-			if (fin.is_open())
+				ftStatus = FT_WritePipe(ftHandle, 0x02, threadBuf[(i + 1) % 2], ulBytesReaded, &ulBytesTransferred, &wrOverlapped);
+			if (!fin)			
+				ftStatus = FT_OTHER_ERROR;
+			else
 			{
-				if (!fin)
-				{				
-					ftStatus = FT_OTHER_ERROR;
-					//pftStruct->ftStatus = ftStatus;
-					//return ftStatus;
-				}
-				else
-				{
-					fin.read(((char *)threadBuf[i % 2]), 0x1000);
-					ulBytesReaded = fin.gcount();
-				}
-			}
-			/*else
-			{
-				ulBytesReaded = 0x1000;
-				ftStatus = FT_WritePipe(ftHandle, 0x02, sourceBuf + 0x1000 * i, ulBytesReaded, &ulBytesTransferred, &wrOverlapped);
-			}		*/	
+				fin.read(((char *)threadBuf[i % 2]), INFRAME);
+				ulBytesReaded = fin.gcount();
+			}			
+#endif // DEBUG			
 			if (ftStatus == FT_IO_PENDING)
 			{
 				ftStatus = FT_GetOverlappedResult(ftHandle, &wrOverlapped, &ulBytesTransferred, TRUE);
-			}			
+			}
+			while (!ReleaseSemaphore(RdSemaphore, 1, NULL))			
+				Sleep(0);		// give up time slice			
 			if (FT_FAILED(ftStatus))
 			{
 				FT_ReleaseOverlapped(ftHandle, &wrOverlapped);
 				FT_AbortPipe(ftHandle, 0x02);
 				pftStruct->ftStatus = ftStatus;				
-				return ftStatus;				
+				break;
 			}
-			Counter += ulBytesTransferred;
-			Counterc += ulBytesReaded;
+			Counter += ulBytesTransferred;					
+			//Counterc += ulBytesReaded;
 		}
 		timeLapse = clock() - timeLapse;
+
 		// Print the result using thread-safe functions.
+		TCHAR msgBuf[255];
+		HANDLE hStdout;
+		// Make sure there is a console to receive output results. 
+		hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+		if (hStdout == INVALID_HANDLE_VALUE)
+		{
+			ftStatus = FT_OTHER_ERROR;
+			pftStruct->ftStatus = ftStatus;
+			break;
+		}
 		size_t cchStringSize;
 		DWORD dwChars;
-		StringCchPrintf(msgBuf, 255, TEXT("TxSpeed:%.2fMB/s, %.4fsec E %x, %x Data\n"),
+		StringCchPrintf(msgBuf, 255, TEXT("TxSpeed:%.2fMB/s, %.4fsec for 0x%xByte Data\n"),
 			(((double)Counter) / 0x100000) / (((double)timeLapse) / CLOCKS_PER_SEC),
 			((double)timeLapse) / CLOCKS_PER_SEC,
-			Counterc,(Counter)
+			Counter//(((double)Counter) / 0x100000)
 		);
 		StringCchLength(msgBuf, 255, &cchStringSize);
 		WriteConsole(hStdout, msgBuf, (DWORD)cchStringSize, &dwChars, NULL);
+		if (FT_FAILED(ftStatus))
+			break;
+#ifdef DEBUG
+		if (!SetEvent(WrFinEvent))
+		{
+			printf("WrT SetEvent failed (%d)\n", GetLastError());			
+		}
+		WaitForSingleObject(WrStartEvent, INFINITE);
+#endif // DEBUG
 	}	
 	return ftStatus;
 }
@@ -334,6 +451,8 @@ BOOL LoopBackTest(UCHAR *wrBuf, UCHAR *rdBuf, ULONG size)
 {
 	for (ULONG i = 0; i < size; i++)
 		if (wrBuf[i] != rdBuf[i])
+		{		
 			return 0;
+		}
 	return 1;	
 }
